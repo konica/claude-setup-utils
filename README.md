@@ -6,13 +6,26 @@ marketplaces, 15 enabled plugins, and one hand-written user-level agent
 
 ## Usage
 
+macOS / Linux:
+
 ```bash
 git clone <this-repo> claude-setup
 cd claude-setup
 ./bootstrap.sh
 ```
 
-Safe to re-run — every step is a no-op if already satisfied.
+Windows (PowerShell):
+
+```powershell
+git clone <this-repo> claude-setup
+cd claude-setup
+# If scripts are blocked, allow this one for the current process only:
+# Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\bootstrap.ps1
+```
+
+Both scripts do the same thing. Safe to re-run — every step is a no-op if
+already satisfied.
 
 ## What this does NOT cover
 
