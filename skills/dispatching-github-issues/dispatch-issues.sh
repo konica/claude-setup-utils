@@ -7,9 +7,10 @@
 # or "Blocked by: #3" makes #3 and #4 blockers. GitHub's native issue
 # dependencies are consulted too, when present.
 #
-# Independent tickets run concurrently, each in its own git worktree and
-# branch. A ticket whose blocker is being worked on in the same run is
-# branched off that blocker's branch (stacked), so it sees the blocker's code.
+# Every ticket that is ready right now runs concurrently, each in its own git
+# worktree and branch, and each ending in its own pull request. That is ONE
+# WAVE, and one invocation dispatches exactly one wave. A blocked ticket waits
+# until its blocker's PR is merged into the trunk; run this again then.
 #
 # See reference.md next to this script for the full guide.
 
@@ -27,13 +28,12 @@ LIMIT=500
 LABELS=()
 EXPLICIT=()
 DRY_RUN=0
-ONE_WAVE=0
-MAX_WAVES=20
 DO_PUSH=1
 DO_PR=1
 DO_ASSIGN=1
 DO_COMMENT=1
-DO_STACK=1
+AGENT_PR=1
+DO_STACK=0
 NATIVE_DEPS=1
 FORCE=0
 CLEANUP=0
@@ -56,6 +56,10 @@ USAGE
 
 With no issue numbers, every open issue is a candidate (narrow with --label).
 
+One invocation dispatches ONE WAVE: every ticket that is ready right now, in
+parallel. A ticket whose blocker has not been merged into the trunk yet is not
+ready, and is left for a later wave. Merge this wave's PRs, then run again.
+
 SELECTION
   -r, --repo OWNER/NAME which repository (default: inferred from the checkout)
   -l, --label LABEL     only issues carrying LABEL (repeatable, AND-ed)
@@ -66,16 +70,16 @@ WHAT TO DO
       --mode MODE       session (default): one attachable background session
                         per ticket, which you can steer with 'claude attach'.
                         print: headless agent that runs to completion.
-      --land            land finished sessions: push the branch, open the PR
+      --land            fallback: push and open the PR for any session that
+                        did not do it itself
       --status          show each dispatched ticket, its session and its state
 
 EXECUTION
-  -j, --jobs N          max tickets launched at once (default $JOBS)
-  -n, --dry-run         print the wave plan and exit; changes nothing
-      --one-wave        dispatch only the currently-ready tickets, then stop
-      --max-waves N     cap on dependency depth (default $MAX_WAVES)
-  -b, --base REF        base branch for the first wave (default: repo default)
-      --no-stack        always branch from --base, never from a blocker branch
+  -j, --jobs N          tickets running in parallel in this wave (default $JOBS)
+  -n, --dry-run         print this wave's plan and exit; changes nothing
+  -b, --base REF        branch this wave builds on (default: repo default)
+      --stack           legacy: start a dependent ticket on its blocker's
+                        branch instead of waiting for that blocker to merge
       --timeout SECS    kill an agent after SECS (0 = no limit)
 
 AGENT
@@ -84,7 +88,7 @@ AGENT
       --agent-cmd CMD   run CMD instead of claude; prompt arrives on stdin,
                         cwd is the ticket worktree (useful for testing)
       --prompt-file F   prompt template; placeholders {{NUMBER}} {{TITLE}}
-                        {{BODY}} {{BRANCH}} {{BASE}} {{REPO}}
+                        {{BODY}} {{BRANCH}} {{BASE}} {{REPO}} {{PUBLISH}}
       --branch-prefix P branch naming, default $BRANCH_PREFIX<number>
       --dep-words RE    alternation of phrases that introduce a blocker
                         reference in an issue body
@@ -95,6 +99,7 @@ AGENT
 AFTER A TICKET
       --no-push         leave the branch local (implies --no-pr)
       --no-pr           do not open a pull request
+      --no-agent-pr     the agent only commits; --land opens the PR later
       --no-assign       do not assign the issue to @me
       --no-comment      do not comment the outcome on the issue
       --cleanup         remove the worktree when a ticket succeeds
@@ -104,7 +109,7 @@ AFTER A TICKET
 EXAMPLES
   $SCRIPT_NAME --dry-run                    # show the wave plan
   $SCRIPT_NAME -j 4 --label ready-for-agent # dispatch, 4 at a time
-  $SCRIPT_NAME --one-wave 41 42                # just these two, one wave
+  $SCRIPT_NAME 41 42                        # just these two tickets
 HELPTEXT
 }
 
@@ -125,9 +130,8 @@ while (($#)); do
     -f|--force)     FORCE=1; shift ;;
     -j|--jobs)      JOBS=${2:?}; shift 2 ;;
     -n|--dry-run|--plan) DRY_RUN=1; shift ;;
-    --one-wave)     ONE_WAVE=1; shift ;;
-    --max-waves)    MAX_WAVES=${2:?}; shift 2 ;;
     -b|--base)      BASE=${2:?}; shift 2 ;;
+    --stack)        DO_STACK=1; shift ;;
     --no-stack)     DO_STACK=0; shift ;;
     --timeout)      TIMEOUT=${2:?}; shift 2 ;;
     -m|--model)     MODEL=${2:?}; shift 2 ;;
@@ -136,8 +140,9 @@ while (($#)); do
     --prompt-file)  PROMPT_TEMPLATE_FILE=${2:?}; shift 2 ;;
     --branch-prefix) BRANCH_PREFIX=${2:?}; shift 2 ;;
     --worktree-root) WORKTREE_ROOT_OPT=${2:?}; shift 2 ;;
-    --no-push)      DO_PUSH=0; DO_PR=0; shift ;;
-    --no-pr)        DO_PR=0; shift ;;
+    --no-push)      DO_PUSH=0; DO_PR=0; AGENT_PR=0; shift ;;
+    --no-pr)        DO_PR=0; AGENT_PR=0; shift ;;
+    --no-agent-pr)  AGENT_PR=0; shift ;;
     --no-assign)    DO_ASSIGN=0; shift ;;
     --no-comment)   DO_COMMENT=0; shift ;;
     --no-native-deps) NATIVE_DEPS=0; shift ;;
@@ -179,6 +184,16 @@ fi
 # GitHub, which wants the branch name. Keep both forms.
 BASE_BRANCH=${BASE#refs/remotes/}
 BASE_BRANCH=${BASE_BRANCH#origin/}
+
+# Whether a blocker has merged is a fact about the remote trunk, and merges
+# happen on GitHub, so the local ref is stale until we fetch. Prefer the remote
+# ref once we have it; fall back to the local one when offline.
+TRUNK_REF=$BASE
+if git -C "$MAIN_ROOT" fetch --quiet origin "$BASE_BRANCH" 2>/dev/null \
+   && git -C "$MAIN_ROOT" rev-parse --verify --quiet "origin/$BASE_BRANCH" >/dev/null
+then
+  TRUNK_REF=origin/$BASE_BRANCH
+fi
 
 STATE_DIR=$MAIN_ROOT/.dispatch
 WORKTREE_ROOT=${WORKTREE_ROOT_OPT:-$MAIN_ROOT/.claude/worktrees/dispatch}
@@ -268,25 +283,37 @@ body_blockers() {
     | sort -un || true          # no match is normal, not an error
 }
 
+# Blockers from GitHub's own issue-dependency feature. Ask for the numbers, not
+# the summary count: a blocker has to be named before it can be tested for
+# having merged, and the count alone only clears when the issue closes.
 declare -A NATIVE_BLOCKED
-native_blocked() {
+native_blockers() {
   local n=$1
-  ((NATIVE_DEPS)) || { echo 0; return; }
+  ((NATIVE_DEPS)) || return 0
   if [[ -z ${NATIVE_BLOCKED[$n]:-} ]]; then
-    NATIVE_BLOCKED[$n]=$(gh api "repos/$REPO/issues/$n" \
-      --jq '.issue_dependencies_summary.blocked_by // 0' 2>/dev/null || echo 0)
+    NATIVE_BLOCKED[$n]=$(gh api "repos/$REPO/issues/$n/dependencies/blocked_by" \
+      --jq '[.[] | select(.state == "open") | .number] | join(" ")' 2>/dev/null) \
+      || NATIVE_BLOCKED[$n]=""
+    # A space, not the empty string, so "no blockers" is a cached answer rather
+    # than a cache miss that re-queries on every readiness check.
+    NATIVE_BLOCKED[$n]=${NATIVE_BLOCKED[$n]:- }
   fi
-  echo "${NATIVE_BLOCKED[$n]}"
+  [[ ${NATIVE_BLOCKED[$n]} == " " ]] && return 0
+  printf '%s\n' ${NATIVE_BLOCKED[$n]}
 }
 
-# Blockers that are still open (and therefore still gate the ticket).
+# Blockers that are still open (and therefore still gate the ticket), from the
+# issue body and from GitHub's dependencies alike — one list, one rule.
 open_blockers() {
   local n=$1 b
-  for b in $(body_blockers "$n"); do
-    [[ -n ${I_STATE[$b]:-} ]] || continue      # unknown number: ignore
-    [[ ${I_STATE[$b]} == OPEN ]] || continue
-    echo "$b"
-  done
+  {
+    for b in $(body_blockers "$n"); do
+      [[ -n ${I_STATE[$b]:-} ]] || continue      # unknown number: ignore
+      [[ ${I_STATE[$b]} == OPEN ]] || continue
+      echo "$b"
+    done
+    native_blockers "$n"
+  } | sort -un
 }
 
 branch_of() { printf '%s%s' "$BRANCH_PREFIX" "$1"; }
@@ -318,10 +345,10 @@ skip_reason() {
 # ------------------------------------------------------------------ prompt --
 
 default_prompt_template() {
-  # The FIRST LINE becomes the session's name in `claude agents`, so it has to
-  # read as the ticket at a glance.
+  # Sessions are named `issue-<n>-<slug>` explicitly, but the first line is the
+  # fallback name if that ever fails, so it leads with the ticket number too.
   cat <<'TPL'
-#{{NUMBER}} {{TITLE}}
+issue-{{NUMBER}}: {{TITLE}}
 
 You are an engineer implementing this GitHub issue in {{REPO}}.
 
@@ -339,8 +366,7 @@ You are an engineer implementing this GitHub issue in {{REPO}}.
 - Write the tests the issue names, and run them. Report real results — if a
   test fails, say so.
 - Commit your work on `{{BRANCH}}` with a message referencing #{{NUMBER}}.
-- Do NOT push, do NOT open a pull request, do NOT merge or switch branches.
-  The dispatcher handles all of that.
+{{PUBLISH}}
 - If the issue is under-specified or you hit a genuine blocker, stop and
   explain it in your final message instead of guessing. Issues that say
   "STOP and report" mean it.
@@ -352,6 +378,31 @@ Finish with a short summary: what you changed, what you ran, what you left out.
 TPL
 }
 
+# What the agent is told to do with its commits. With AGENT_PR the ticket ends
+# as a reviewable PR without anyone running --land; without it the old contract
+# holds and the dispatcher publishes.
+publish_clause() {
+  local n=$1 branch=$2
+  if ((AGENT_PR)); then
+    cat <<CLAUSE
+- Then publish the work yourself, so this ticket ends as one reviewable PR:
+    git push -u origin $branch
+    gh pr create --base $BASE_BRANCH --head $branch \\
+      --title "${I_TITLE[$n]} (#$n)" --body "Closes #$n"
+  If a pull request for this branch already exists, push to it instead of
+  opening a second one. Put the PR URL in your final message.
+- Do NOT merge anything, do NOT switch branches, and do NOT touch another
+  ticket's branch. A human merges your PR; that is what unblocks the tickets
+  that depend on this one.
+CLAUSE
+  else
+    cat <<'CLAUSE'
+- Do NOT push, do NOT open a pull request, do NOT merge or switch branches.
+  The dispatcher handles all of that.
+CLAUSE
+  fi
+}
+
 build_prompt() {
   local n=$1 branch=$2 base=$3 tpl
   if [[ -n $PROMPT_TEMPLATE_FILE ]]; then
@@ -359,6 +410,7 @@ build_prompt() {
   else
     tpl=$(default_prompt_template)
   fi
+  tpl=${tpl//\{\{PUBLISH\}\}/$(publish_clause "$n" "$branch")}
   tpl=${tpl//\{\{NUMBER\}\}/$n}
   tpl=${tpl//\{\{TITLE\}\}/${I_TITLE[$n]}}
   tpl=${tpl//\{\{BODY\}\}/${I_BODY[$n]}}
@@ -440,6 +492,18 @@ prepare_ticket() {
 
 # --- session mode: an attachable background session per ticket ---------------
 
+# `claude agents` and `claude attach` list sessions by name, so lead with the
+# ticket: one session, one issue, findable at a glance among a wave of them.
+session_name() {
+  local slug
+  slug=$(printf '%s' "${I_TITLE[$1]:-}" \
+         | tr '[:upper:]' '[:lower:]' \
+         | sed -E 's/[^a-z0-9]+/-/g' \
+         | cut -c1-40 \
+         | sed -E 's/^-+|-+$//g')
+  printf 'issue-%s%s' "$1" "${slug:+-$slug}"
+}
+
 # Records what a later --land or --status invocation needs to find the work.
 remember_session() {
   printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" > "$SESSION_DIR/$5"
@@ -466,7 +530,8 @@ launch_session() {
   local logf=$RUN_DIR/logs/issue-$n.log
   local promptf=$RUN_DIR/prompts/issue-$n.md
 
-  local -a cmd=(claude --bg --permission-mode "$PERMISSION_MODE")
+  local -a cmd=(claude --bg --name "$(session_name "$n")" \
+                --permission-mode "$PERMISSION_MODE")
   if [[ -n $MODEL ]]; then cmd+=(--model "$MODEL"); fi
 
   if ! ( cd -P "$wt" && "${cmd[@]}" "$(cat "$promptf")" ) >>"$logf" 2>&1; then
@@ -646,9 +711,33 @@ fi
 declare -A DISPATCHED=()   # issue -> 1 once its branch carries work
 declare -A SCHEDULED=()    # issue -> wave number (planning + execution)
 
-# A blocker is cleared once its branch carries work, not only once the issue
-# closes — otherwise nothing downstream could start until PRs were merged, and
-# a second invocation could never pick up where the first left off.
+declare -A PR_STATE=()
+# MERGED | OPEN | CLOSED | NONE for a branch's pull request, asked once.
+pr_state_of() {
+  local br=$1
+  if [[ -z ${PR_STATE[$br]:-} ]]; then
+    PR_STATE[$br]=$(gh pr view "$br" --repo "$REPO" --json state --jq .state \
+                    2>/dev/null) || PR_STATE[$br]=NONE
+    [[ -n ${PR_STATE[$br]} ]] || PR_STATE[$br]=NONE
+  fi
+  printf '%s' "${PR_STATE[$br]}"
+}
+
+# A blocker clears only once its work is ON THE TRUNK — its PR merged, or its
+# branch already an ancestor of the trunk. (A blocker whose issue is closed
+# never reaches here: open_blockers filters those out.) Asking for the merge is
+# the point: it is what keeps wave 2 from being written against code that
+# review may still change. The PR check comes first because GitHub deletes the
+# branch on merge, and a deleted branch is not an ancestor of anything.
+blocker_landed() {
+  local br; br=$(branch_of "$1")
+  [[ $(pr_state_of "$br") == MERGED ]] && return 0
+  branch_exists "$br" || return 1
+  git -C "$MAIN_ROOT" merge-base --is-ancestor "$br" "$TRUNK_REF" 2>/dev/null
+}
+
+# --stack only: the pre-merge-gating rule, where a blocker cleared as soon as
+# its branch carried work and dependents were stacked on top of it.
 branch_has_work() {
   local br; br=$(branch_of "$1")
   branch_exists "$br" || return 1
@@ -663,40 +752,37 @@ ready_now() {
     [[ -z ${SCHEDULED[$n]:-} ]] || continue
     blocked=0
     for b in $(open_blockers "$n"); do
-      [[ -n ${DISPATCHED[$b]:-} ]] && continue
-      branch_has_work "$b" && continue
+      if ((DO_STACK)); then
+        [[ -n ${DISPATCHED[$b]:-} ]] && continue
+        branch_has_work "$b" && continue
+      else
+        blocker_landed "$b" && continue
+      fi
       blocked=1; break
     done
-    if ((!blocked)) && ((NATIVE_DEPS)) && [[ $(native_blocked "$n") != 0 ]]; then
-      blocked=1
-    fi
     ((blocked)) || ready+=("$n")
   done
   printf '%s\n' "${ready[@]:-}"
 }
 
 if ((DRY_RUN)); then
-  wave=0
-  while :; do
-    mapfile -t batch < <(ready_now)
-    [[ -n ${batch[0]:-} ]] || break
-    wave=$((wave + 1))
-    ((wave <= MAX_WAVES)) || break
-    printf 'Wave %d — %d ticket(s), %d at a time:\n' "$wave" "${#batch[@]}" "$JOBS"
+  mapfile -t batch < <(ready_now)
+  if [[ -n ${batch[0]:-} ]]; then
+    printf 'This wave — %d ticket(s), %d in parallel:\n' "${#batch[@]}" "$JOBS"
     for n in "${batch[@]}"; do
       IFS=$'\t' read -r tbase textras < <(base_for "$n")
       printf '  #%-4s %-55.55s  from %s%s\n' "$n" "${I_TITLE[$n]}" "$tbase" \
         "${textras:+ + $textras}"
-      SCHEDULED[$n]=$wave
-      DISPATCHED[$n]=1
+      SCHEDULED[$n]=1
     done
     echo
-    ((ONE_WAVE)) && break
-  done
+  else
+    printf 'Nothing is ready: every candidate is waiting on a blocker.\n\n'
+  fi
   left=()
   for n in "${RUNNABLE[@]}"; do [[ -n ${SCHEDULED[$n]:-} ]] || left+=("$n"); done
   if ((${#left[@]})); then
-    echo "Not reachable in this run (blocker outside the set, or a cycle):"
+    echo "Later waves — dispatch these once their blocker's PR is merged:"
     for n in "${left[@]}"; do
       printf '  #%-4s %-55.55s  blocked by %s\n' "$n" "${I_TITLE[$n]}" \
         "$(open_blockers "$n" | tr '\n' ' ')"
@@ -722,6 +808,9 @@ if [[ $ACTION == status ]]; then
     commits=$(git -C "$MAIN_ROOT" rev-list --count "$base..$branch" 2>/dev/null || echo '?')
     printf '  #%-4s %-40.40s  %-8s  %-9s  %s commit(s)\n' \
       "$n" "${I_TITLE[$n]:-}" "$id" "$st" "$commits"
+    pr=$(gh pr view "$branch" --repo "$REPO" --json state,url \
+         --jq '"\(.state)  \(.url)"' 2>/dev/null) || pr=""
+    printf '        pr:     %s\n' "${pr:-none yet}"
     printf '        attach: claude attach %s\n' "$id"
   done
   ((found)) || echo "Nothing dispatched yet."
@@ -793,48 +882,47 @@ if [[ $MODE == session ]]; then
     printf '  claude attach %-9s     steer #%s\n' "$(session_field "$n" 1)" "$n"
   done
   echo
-  echo "When a session is done, land its work:"
-  echo "  $0 --land                     push branches and open PRs"
-  echo "  $0 --status                   see what each session is doing"
+  if ((AGENT_PR)); then
+    echo "Each session pushes its own branch and opens its own PR when it finishes."
+    echo "  $0 --status                   who is working, and its PR"
+    echo "  $0 --land                     fallback, for a session that did not"
+  else
+    echo "Sessions only commit; you publish their work:"
+    echo "  $0 --status                   who is working, and its PR"
+    echo "  $0 --land                     push branches and open PRs"
+  fi
   echo
-  echo "Then run this again for the next wave — tickets whose blockers now have"
-  echo "work are picked up automatically."
+  echo "That is this wave. Review and merge these PRs into $BASE_BRANCH, then run"
+  echo "this again — the tickets they were blocking become ready then, not before."
   exit 0
 fi
 
-# --- print mode: headless agents, waves chained in one invocation ------------
+# --- print mode: headless agents, one wave, then stop -----------------------
+# No wave loop: the tickets left over are waiting on a merge that only a human
+# can do, so chaining here would mean building wave 2 on unreviewed code.
 trap 'log "interrupted - stopping agents"; cleanup_children; exit 130' INT TERM
 
-wave=0
-while :; do
-  wave=$((wave + 1))
-  if ((wave > MAX_WAVES)); then log "hit --max-waves $MAX_WAVES"; break; fi
+mapfile -t batch < <(ready_now)
+[[ -n ${batch[0]:-} ]] || die "nothing is ready to dispatch"
 
-  load_issues
-  mapfile -t batch < <(ready_now)
-  [[ -n ${batch[0]:-} ]] || break
+log "dispatching ${#batch[@]} ticket(s), $JOBS in parallel - ${batch[*]}"
+PIDS=()
+for n in "${batch[@]}"; do
+  SCHEDULED[$n]=1
+  IFS=$'\t' read -r tbase textras < <(base_for "$n")
+  wait_for_slot
+  log "  #$n ${I_TITLE[$n]} (from $tbase)"
+  run_ticket_print "$n" "$tbase" "$textras" &
+  PIDS+=($!)
+done
+wait || true
 
-  log "wave $wave: dispatching ${#batch[@]} ticket(s) - ${batch[*]}"
-  PIDS=()
-  for n in "${batch[@]}"; do
-    SCHEDULED[$n]=$wave
-    IFS=$'\t' read -r tbase textras < <(base_for "$n")
-    wait_for_slot
-    log "  #$n ${I_TITLE[$n]} (from $tbase)"
-    run_ticket_print "$n" "$tbase" "$textras" &
-    PIDS+=($!)
-  done
-  wait || true
-
-  for n in "${batch[@]}"; do
-    st=$(get_status "$n")
-    case $st in
-      landed:*) DISPATCHED[$n]=1; log "  #$n OK - ${st#landed: }" ;;
-      *)        log "  #$n $st" ;;
-    esac
-  done
-
-  ((ONE_WAVE)) && break
+for n in "${batch[@]}"; do
+  st=$(get_status "$n")
+  case $st in
+    landed:*) log "  #$n OK - ${st#landed: }" ;;
+    *)        log "  #$n $st" ;;
+  esac
 done
 
 trap - INT TERM
@@ -844,7 +932,7 @@ echo "Summary  ($RUN_DIR)"
 ok=0; bad=0; pending=0
 for n in "${RUNNABLE[@]}"; do
   if [[ -z ${SCHEDULED[$n]:-} ]]; then
-    printf '  #%-4s %-45.45s  NOT REACHED (blocked by %s)\n' "$n" "${I_TITLE[$n]}" \
+    printf '  #%-4s %-45.45s  NEXT WAVE (blocked by %s)\n' "$n" "${I_TITLE[$n]}" \
       "$(open_blockers "$n" | tr '\n' ' ')"
     pending=$((pending + 1))
     continue
@@ -854,5 +942,9 @@ for n in "${RUNNABLE[@]}"; do
   case $st in landed:*) ok=$((ok + 1)) ;; *) bad=$((bad + 1)) ;; esac
 done
 echo
-echo "$ok succeeded, $bad failed, $pending not reached. Logs: $RUN_DIR/logs/"
-((bad == 0 && pending == 0)) || exit 1
+echo "$ok succeeded, $bad failed, $pending left for a later wave."
+echo "Logs: $RUN_DIR/logs/"
+if ((pending)); then
+  echo "Merge this wave's PRs into $BASE_BRANCH, then run $SCRIPT_NAME again."
+fi
+((bad == 0)) || exit 1
