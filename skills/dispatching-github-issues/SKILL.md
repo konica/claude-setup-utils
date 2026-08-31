@@ -91,11 +91,37 @@ A dispatchable ticket has one deliverable, names its tests, declares blockers
 on a `Depends on #N` line, and says what to do when an assumption fails ("if X
 fails, stop and report"). Without that, agents guess.
 
+## Keeping the board dispatchable
+
+The dispatcher plans from labels and blocker declarations, so those have to be
+right. `triage-lint.sh` (next to this file) checks the invariants that can be
+computed, and exits non-zero so it can gate CI:
+
+```bash
+bash "$SKILL/triage-lint.sh"        # report only, changes nothing
+bash "$SKILL/triage-lint.sh" --fix  # repair what is mechanical
+```
+
+| | Invariant |
+| --- | --- |
+| E1 | exactly one state label per open issue |
+| E2 | exactly one category label per open issue |
+| E3 | `blocked` is present iff the issue has an open blocker |
+| E4 | every `Depends on #N` in a body is a GitHub native dependency too |
+| E5 | the dependency graph is acyclic |
+
+`--fix` repairs E3 and E4, the two that are mechanically determined. E1, E2 and
+E5 need someone to decide what the answer is, and are only ever reported. It
+reads blockers from the same two places the dispatcher does, so a board that
+passes is a board the dispatcher can plan from. Label names are configurable —
+`--state-labels`, `--category-labels`, `-L`.
+
 ## Common mistakes
 
 | Mistake | What happens |
 | --- | --- |
 | Skipping `--dry-run` | You learn the graph was wrong after 12 agents ran |
+| Dispatching a board `triage-lint.sh` fails | A missing `Depends on` edge means the wave gate can't see the dependency, and wave 2 goes out early |
 | Dispatching untriaged tickets | Agents invent the spec; use `--label` |
 | Expecting a second wave to go out on its own | It won't. Merge this wave's PRs, then run the script again |
 | Re-running before merging | Correct and harmless: it reports the same tickets still waiting, and dispatches nothing |

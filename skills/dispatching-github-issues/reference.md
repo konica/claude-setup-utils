@@ -47,6 +47,44 @@ Because a blocker cannot land while the script is running, one invocation
 dispatches exactly one wave. Everything still blocked is listed under
 "Later waves" and left alone.
 
+## Linting the board first
+
+The plan is only as good as the labels and the `Depends on` lines it reads.
+`triage-lint.sh`, next to the dispatcher, checks the invariants that can be
+computed and exits non-zero when any remain, so it works as a CI gate:
+
+| | Invariant | `--fix` |
+| --- | --- | --- |
+| E1 | exactly one state label per open issue | reported |
+| E2 | exactly one category label per open issue | reported |
+| E3 | `blocked` present iff the issue has an open blocker | repaired |
+| E4 | every body-declared blocker is a GitHub native dependency too | repaired |
+| E5 | the dependency graph is acyclic | reported |
+
+```bash
+"$SKILL/triage-lint.sh"                       # report; exit 1 on violations
+"$SKILL/triage-lint.sh" --fix                 # repair E3 and E4
+"$SKILL/triage-lint.sh" --state-labels a,b    # your board's label vocabulary
+```
+
+E3 and E4 are repaired because both are mechanically determined: whether an
+issue has an open blocker is a fact, and a `Depends on #3` line that is not
+also a native dependency is an edge the GitHub UI cannot show. E1, E2 and E5
+are judgment — which label is right, which edge in a cycle is wrong — so they
+are only ever reported.
+
+E4 matters most to the dispatcher: a blocker declared only in prose is still
+honoured (bodies are parsed), but one declared only as a native dependency is
+invisible to a reader, and a board where the two disagree is a board where the
+wave gate and the humans reading it have different pictures.
+
+One nuance worth knowing: E3's "open blocker" means the blocker's **issue** is
+still open, while the dispatcher's wave gate asks whether the blocker has
+**merged**. These agree whenever a PR closes its issue (`Closes #<n>`, which is
+what the agents write), and differ only in the window between the merge and the
+close — where the label reads `blocked` for a ticket the dispatcher already
+considers ready. `--fix` clears the label as soon as the issue closes.
+
 ## Two modes
 
 **Session mode (the default)** gives each ticket an attachable Claude Code
