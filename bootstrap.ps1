@@ -34,6 +34,7 @@ $Plugins = @(
 # Skills that work anywhere Claude Code does. They encode no sandbox paths, so
 # unlike $SandboxSkills in bootstrap.sh these install on the host too.
 $PortableSkills = @(
+  'creating-up-down-scripts'
   'dispatching-github-issues'
   'provisioning-with-ansible'
 )

@@ -32,6 +32,7 @@ PLUGINS=(
 # Skills that work anywhere Claude Code does. They encode no sandbox paths, so
 # they install on a host machine too.
 PORTABLE_SKILLS=(
+  "creating-up-down-scripts"
   "dispatching-github-issues"
   "provisioning-with-ansible"
 )

@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# down — stop everything up started. Keeps data unless --clean.
+set -euo pipefail
+cd "$(dirname "$0")"
+
+STATE_DIR=.dev
+CLEAN=0
+[ "${1:-}" = "--clean" ] && CLEAN=1
+
+# ------------------------------------------------------------------ harness --
+# up records a process GROUP id (it starts services with setsid), so the whole
+# tree dies even when the npm/uv wrapper that led it has already exited. This is
+# why `down` never needs `pkill -f`, which would also kill the developer's other
+# work matching the same pattern.
+stop() {                            # stop <name>
+  local name=$1 pf=$STATE_DIR/$name.pid pgid
+  [ -f "$pf" ] || return 0
+  pgid=$(cat "$pf")
+  if kill -0 -- "-$pgid" 2>/dev/null; then
+    kill -- "-$pgid" 2>/dev/null || true
+    for _ in $(seq 10); do kill -0 -- "-$pgid" 2>/dev/null || break; sleep 1; done
+    kill -9 -- "-$pgid" 2>/dev/null || true
+    echo "down: stopped $name"
+  fi
+  rm -f "$pf"
+}
+
+# ----------------------------------------------------------------- SERVICES --
+# Same names `start` used in ./up. Reverse order of startup.
+for name in web api; do stop "$name"; done
+
+if [ "$CLEAN" = 1 ]; then
+  # Destroys database volumes. Only ever behind an explicit flag.
+  docker compose down --volumes --remove-orphans
+  rm -rf "$STATE_DIR"
+  echo "down: removed containers, volumes and $STATE_DIR"
+else
+  docker compose down --remove-orphans
+  echo "down: stopped (data kept — use ./down --clean to wipe it)"
+fi
