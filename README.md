@@ -33,6 +33,12 @@ installs overwrite in place rather than nesting.
 
 `skills/` also holds skills that work on any machine Claude Code runs on:
 
+- `creating-up-down-scripts` — turns a multi-command dev setup into `./up` and
+  `./down`, with a template pair to adapt. Encodes the traps that make the
+  naive version fail: readiness polling instead of `sleep`, process groups
+  instead of wrapper PIDs, liveness checked before the health URL, and binding
+  the servers where the client actually is — loopback is invisible from a
+  container, VM, WSL box, or sandbox, and it fails silently.
 - `dispatching-github-issues` — works a GitHub backlog with coding agents. It
   reads the issues at run time and derives the order from each ticket's
   `Depends on #N` line, then gives every dispatchable ticket its own worktree,

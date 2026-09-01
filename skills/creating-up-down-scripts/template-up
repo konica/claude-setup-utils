@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+# up — start everything this app needs, then say where it is.
+#
+# A real, working example (FastAPI + Vite + Postgres). Swap the SERVICES
+# section for your own; the harness above it is the same everywhere, and every
+# line of it exists because the naive version failed in practice.
+set -euo pipefail
+cd "$(dirname "$0")"
+
+STATE_DIR=.dev                      # pidfiles + logs; add to .gitignore
+mkdir -p "$STATE_DIR"
+
+# ------------------------------------------------------------------ harness --
+need() {                            # need <tool> <how-to-get-it>
+  command -v "$1" >/dev/null 2>&1 || { echo "up: missing '$1' — $2" >&2; exit 1; }
+}
+
+load_env() {                        # export a .env the app itself may not read
+  [ -f "$1" ] || return 0
+  set -a; . "$1"; set +a
+}
+
+need_env() {                        # need_env VAR...
+  local miss=()
+  for v in "$@"; do [ -n "${!v:-}" ] || miss+=("$v"); done
+  [ ${#miss[@]} -eq 0 ] && return 0
+  echo "up: missing env: ${miss[*]}" >&2
+  echo "    set them in .env (see .env.example)" >&2
+  exit 1
+}
+
+# Wrappers (npm, uv run, yarn, poetry run) exec or exit, so the pid you captured
+# is a corpse while the server it launched is still serving. Track the process
+# GROUP — `start` uses setsid, making the recorded pid a pgid.
+alive() {
+  local pf=$STATE_DIR/$1.pid
+  [ -f "$pf" ] && kill -0 -- "-$(cat "$pf")" 2>/dev/null
+}
+
+# Probe BOTH loopback stacks. Dev servers bind inconsistently — one may be
+# IPv4-only and another IPv6-only in the same project — so a single-stack probe
+# happily reports "free" for a port that is very much taken.
+port_busy() {
+  (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null && return 0
+  (exec 3<>"/dev/tcp/::1/$1")       2>/dev/null && return 0
+  return 1
+}
+
+start() {                           # start <name> <port> <command...>
+  local name=$1 port=$2; shift 2
+  if alive "$name"; then echo "up: $name already running"; return 0; fi
+  # Deliberately a free-port check, not a health check: whatever answers on this
+  # port may belong to another project entirely, and must never read as "ours".
+  if port_busy "$port"; then
+    echo "up: port $port is in use by a process ./up did not start." >&2
+    echo "    stop it, or re-run with $(echo "$name" | tr a-z A-Z)_PORT=<free port>" >&2
+    exit 1
+  fi
+  setsid nohup "$@" >"$STATE_DIR/$name.log" 2>&1 &
+  echo $! >"$STATE_DIR/$name.pid"   # setsid makes this pid the process group id
+  echo "up: started $name (pgid $!) → $STATE_DIR/$name.log"
+}
+
+wait_for() {                        # wait_for <url> <name> [timeout-seconds]
+  local url=$1 name=$2 limit=${3:-90} n=0
+  while :; do
+    # Liveness FIRST. If our process died and something else is listening on
+    # that port, trusting the URL makes `up` exit 0 while the app is down.
+    if ! alive "$name"; then
+      echo "up: $name is not running:" >&2
+      tail -20 "$STATE_DIR/$name.log" >&2; exit 1
+    fi
+    curl -fs -o /dev/null "$url" 2>/dev/null && return 0
+    n=$((n + 1))
+    if [ "$n" -ge "$limit" ]; then
+      echo "up: $name not ready after ${limit}s:" >&2
+      tail -20 "$STATE_DIR/$name.log" >&2; exit 1
+    fi
+    sleep 1
+  done
+}
+
+# ----------------------------------------------------------------- SERVICES --
+# Project-specific from here down. Keep it short and declarative.
+
+need docker "https://docs.docker.com/get-docker/"
+need uv     "https://docs.astral.sh/uv/getting-started/installation/"
+need npm    "https://nodejs.org"
+need curl   "install curl"
+
+load_env .env
+# List what startup genuinely requires; missing keys are named, not guessed at.
+need_env DATABASE_URL SESSION_SECRET
+
+: "${API_PORT:=8000}"
+: "${WEB_PORT:=5173}"
+
+# Dev servers listen on loopback by default, which is right only while the
+# browser runs on this machine. When it does not — a container, a VM, WSL, a
+# remote dev box — the request arrives on an external interface, where a
+# loopback socket answers nothing, and it fails silently. So bind every
+# interface when the client is elsewhere and stay off the LAN when it is not.
+# SANDBOX_VM_ID marks a Claude Code sandbox; swap in your own marker. An
+# explicit BIND_HOST wins either way.
+: "${BIND_HOST:=${SANDBOX_VM_ID:+0.0.0.0}}"
+: "${BIND_HOST:=127.0.0.1}"
+
+# --wait blocks on the healthchecks already declared in the compose file, so
+# there is nothing here to poll and no container name to hardcode.
+docker compose up -d --wait
+
+export FRONTEND_ORIGIN="${FRONTEND_ORIGIN:-http://localhost:$WEB_PORT}"
+
+# Dependency installs are cheap when already satisfied — keeping them here is
+# what lets `up` stay the single command a developer has to know. Run them
+# unconditionally: `[ -d node_modules ] || install` reads "installed" for a
+# directory a failed install left behind, and then never repairs it.
+(cd backend && uv sync --quiet --all-extras)
+(cd frontend && npm install --silent)
+
+# Every server gets --host. Binding only the one you happened to test leaves the
+# page loading on the other machine while each API call it makes fails.
+start api "$API_PORT" uv run --project backend \
+      uvicorn app.main:app --host "$BIND_HOST" --port "$API_PORT"
+start web "$WEB_PORT" npm --prefix frontend run dev -- \
+      --host "$BIND_HOST" --port "$WEB_PORT" --strictPort
+
+wait_for "http://localhost:$API_PORT/health" api
+wait_for "http://localhost:$WEB_PORT"        web
+
+cat <<EOF
+
+  app   http://localhost:$WEB_PORT
+  api   http://localhost:$API_PORT
+  logs  $STATE_DIR/*.log
+  stop  ./down
+EOF
+
+# When the app runs elsewhere, those URLs are that machine's localhost and not
+# the developer's. Forwarding is a command on their side, which this script
+# cannot run, so name it exactly — below is the Claude Code sandbox form; adapt
+# it to whatever forwards ports in your setup. Same port number on both sides
+# deliberately: FRONTEND_ORIGIN and the frontend's API base URL are built from
+# these numbers, and remapping them breaks CORS.
+if [ -n "${SANDBOX_VM_ID:-}" ]; then
+  cat <<EOF
+  host  those are this sandbox's localhost — to browse from your machine, run
+        there: sbx ports $SANDBOX_VM_ID --publish $WEB_PORT:$WEB_PORT/tcp
+               sbx ports $SANDBOX_VM_ID --publish $API_PORT:$API_PORT/tcp
+
+EOF
+fi
