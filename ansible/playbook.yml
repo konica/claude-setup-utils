@@ -1,0 +1,52 @@
+# Installs the host-level tools this repo's own scripts call directly:
+# dispatch-issues.sh and triage-lint.sh require gh/jq/git on PATH (see the
+# tool check at the top of dispatch-issues.sh), and bootstrap.sh/.ps1 use git
+# to clone. The claude CLI itself is deliberately NOT provisioned here:
+# bootstrap.ps1 already treats it as a prerequisite ("claude CLI not found on
+# PATH. Install Claude Code first") since it's the tool you'd be running this
+# playbook from.
+#
+# Run with: ansible-playbook ansible/playbook.yml --ask-become-pass
+---
+- name: Provision claude-setup-utils dev environment
+  hosts: localhost
+  connection: local
+  become: true
+  tasks:
+    - name: Install git (used by bootstrap.sh/.ps1 and dispatch-issues.sh)
+      ansible.builtin.package:
+        name: git
+        state: present
+
+    - name: Install jq (parses gh/claude JSON output in dispatch-issues.sh)
+      ansible.builtin.package:
+        name: jq
+        state: present
+
+    # gh isn't in Debian/Ubuntu's default repos on every supported release,
+    # so add the official apt repo first. Homebrew (macOS) and dnf (Fedora)
+    # already carry `gh` directly, so the package task below covers them
+    # without this step.
+    - name: Determine dpkg architecture
+      ansible.builtin.command: dpkg --print-architecture
+      register: dpkg_arch
+      changed_when: false
+      when: ansible_facts['os_family'] == 'Debian'
+
+    - name: Add the GitHub CLI apt signing key
+      ansible.builtin.get_url:
+        url: https://cli.github.com/packages/githubcli-archive-keyring.gpg
+        dest: /usr/share/keyrings/githubcli-archive-keyring.gpg
+        mode: "0644"
+      when: ansible_facts['os_family'] == 'Debian'
+
+    - name: Add the GitHub CLI apt repository
+      ansible.builtin.apt_repository:
+        repo: "deb [arch={{ dpkg_arch.stdout }} signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main"
+        filename: github-cli
+      when: ansible_facts['os_family'] == 'Debian'
+
+    - name: Install the GitHub CLI (gh)
+      ansible.builtin.package:
+        name: gh
+        state: present
