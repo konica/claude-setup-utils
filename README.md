@@ -5,16 +5,6 @@ marketplaces, 15 enabled plugins, one hand-written user-level agent
 (`application-architect`), and two kinds of user-level skill — portable ones
 that install anywhere, and sandbox-only ones.
 
-## Prerequisites
-
-`dispatch-issues.sh` and `triage-lint.sh` need `git`, `gh` (authenticated),
-and `jq` on PATH; `bootstrap.sh`/`.ps1` need `git` and an already-installed
-`claude` CLI. Reproduce the first three with:
-
-```bash
-ansible-playbook ansible/playbook.yml --ask-become-pass
-```
-
 ## Usage
 
 macOS / Linux:
