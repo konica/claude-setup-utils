@@ -50,10 +50,6 @@ One file, a flat `tasks:` list, one task (or small group) per tool with a commen
 
 If the project already has a different `ansible/` structure, follow that instead of imposing this one.
 
-A fleshed-out starter covering every row below — including the Python one —
-lives at `template/ansible/playbook.yml`. Copy it to `ansible/playbook.yml` in
-the target project and edit from there.
-
 ## Quick reference
 
 | Need | Module | Notes |
@@ -63,7 +59,6 @@ the target project and edit from there.
 | Download a binary/installer | `ansible.builtin.get_url` + `file` mode | Pin a version/URL — don't `curl \| sh` |
 | Node/npm global tool | `community.general.npm` | `global: true` |
 | One-off command | `ansible.builtin.command` / `shell` | Always add `creates:` or a `when:` guard — without one it reruns every time |
-| Python CLI tool / project venv | `community.general.pipx` (install the tool) + `command: uv sync` (`creates:` the venv's python) | Never `pip install` a global tool. Inside the Claude Code sandbox, see the setup-python-venv skill — the venv path there is `~/.venvs/<project>`, not in-project |
 
 ## How to run it
 
