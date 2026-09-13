@@ -60,6 +60,10 @@ The rest of `skills/` is specific to the Claude Code sandbox VM:
 - `setup-python-venv` — keeps Python venvs at `~/.venvs/<project>`, because the
   `/c/...` virtiofs mounts reject symlink creation and any in-project `.venv`
   fails to build.
+- `setup-npm-packages` — same root cause, npm side: `bin-links=false` in
+  `.npmrc` plus rewriting `package.json` scripts to invoke each tool via
+  `node node_modules/<pkg>/<bin>` directly, so `npm install` stops trying (and
+  failing) to symlink `node_modules/.bin/*` on the `/c/...` mounts.
 - `remote-debug-python` — attaches VS Code on the host to a `debugpy` listener
   in the sandbox, via `sbx ports ... --publish`.
 
