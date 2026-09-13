@@ -42,6 +42,7 @@ PORTABLE_SKILLS=(
 SANDBOX_SKILLS=(
   "remote-debug-python"
   "setup-python-venv"
+  "setup-npm-packages"
 )
 
 # FORCE_SANDBOX=1/0 overrides detection (useful for testing both branches).
